@@ -355,12 +355,18 @@ function sealOrganizationAuditEventLog() {
   return null;
 }
 
+// A hook that finds a drain running asks it for another pass instead of
+// starting its own: the running drain may have listed its queues before this
+// hook staged anything, and would otherwise leave that for the next turn.
+const DRAIN_AGAIN_FILE = `${DRAIN_ONCE_LOCK_FILE}.again`;
+
 function shouldSpawnDrainOnce() {
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
     const st = fs.statSync(DRAIN_ONCE_LOCK_FILE);
     if (Date.now() - st.mtimeMs < DRAIN_ONCE_LOCK_STALE_MS) {
-      console.error(`[skillmeter] Drain trigger skipped: recent drain already requested`);
+      try { fs.writeFileSync(DRAIN_AGAIN_FILE, ""); } catch {}
+      console.error(`[skillmeter] Drain trigger skipped: recent drain already requested; asked it for another pass`);
       return false;
     }
   } catch (err) {
@@ -380,6 +386,16 @@ function shouldSpawnDrainOnce() {
 
 function clearDrainOnceLock() {
   try { fs.unlinkSync(DRAIN_ONCE_LOCK_FILE); } catch {}
+}
+
+// True, once, when a hook asked the running drain for another pass.
+function takeDrainRequest() {
+  try {
+    fs.unlinkSync(DRAIN_AGAIN_FILE);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // One hook process asks for at most one drain: a Stop that records and then
@@ -1991,6 +2007,7 @@ module.exports = {
   initializeTranscriptCursor,
   discardSkippedSessionArtifacts,
   clearDrainOnceLock,
+  takeDrainRequest,
   spawnDetachedDrain,
   drainFailedLogs,
   drainDeltaChunks,
