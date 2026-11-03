@@ -35,8 +35,10 @@ const {
 } = require("./chunk-retry");
 const {
   parseJsonl,
+  parseJsonlAt,
   lastContentUuid,
   turnNumbers,
+  turnStartIndex,
   turnDestinations,
   buildChunkPlan,
 } = require("./transcript-delta");
@@ -355,12 +357,18 @@ function sealOrganizationAuditEventLog() {
   return null;
 }
 
+// A hook that finds a drain running asks it for another pass instead of
+// starting its own: the running drain may have listed its queues before this
+// hook staged anything, and would otherwise leave that for the next turn.
+const DRAIN_AGAIN_FILE = `${DRAIN_ONCE_LOCK_FILE}.again`;
+
 function shouldSpawnDrainOnce() {
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
     const st = fs.statSync(DRAIN_ONCE_LOCK_FILE);
     if (Date.now() - st.mtimeMs < DRAIN_ONCE_LOCK_STALE_MS) {
-      console.error(`[skillmeter] Drain trigger skipped: recent drain already requested`);
+      try { fs.writeFileSync(DRAIN_AGAIN_FILE, ""); } catch {}
+      console.error(`[skillmeter] Drain trigger skipped: recent drain already requested; asked it for another pass`);
       return false;
     }
   } catch (err) {
@@ -380,6 +388,16 @@ function shouldSpawnDrainOnce() {
 
 function clearDrainOnceLock() {
   try { fs.unlinkSync(DRAIN_ONCE_LOCK_FILE); } catch {}
+}
+
+// True, once, when a hook asked the running drain for another pass.
+function takeDrainRequest() {
+  try {
+    fs.unlinkSync(DRAIN_AGAIN_FILE);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // One hook process asks for at most one drain: a Stop that records and then
@@ -1021,18 +1039,25 @@ function stageTranscriptDelta(transcriptPath, promptId, deviceId, repository) {
     return { chunks: 0, deferred: true };
   }
 
-  let raw;
+  let read;
   try {
-    raw = fs.readFileSync(transcriptPath, "utf8");
+    read = readStagingWindow(transcriptPath, transcriptId, repository);
   } catch (err) {
     console.error(`[skillmeter] Transcript delta read failed: ${err.message}`);
     return { chunks: 0 };
   }
 
-  const { objs } = parseJsonl(raw);
+  const { objs, offsets } = read;
+  const turns = turnNumbers(objs);
+  const turnOffsetOf = (uuid) => {
+    const index = uuid ? objs.findLastIndex((record) => record?.uuid === uuid) : -1;
+    return index === -1 ? undefined : offsets[turnStartIndex(turns, index)];
+  };
   const places = transcriptPlaces();
   const destinations = turnDestinations(objs, places.of, unrecordedTurns(transcriptId));
-  let chunks = stageRepositoryTurns(objs, destinations, transcriptId, promptId, repository);
+  const stage = (pid, target) =>
+    stageRepositoryTurns(objs, destinations, transcriptId, pid, target, turnOffsetOf);
+  let chunks = stage(promptId, repository);
   // A turn's own Stop may not stage it: the turn ended outside any repository,
   // or its last lines were written after that Stop read the transcript. Every
   // other repository already recording this transcript takes its turns here.
@@ -1044,7 +1069,7 @@ function stageTranscriptDelta(transcriptPath, promptId, deviceId, repository) {
     if (!cursor || cursor.discarded) continue;
     if (place.recording) {
       // The triggering turn is not this repository's, so no prompt id.
-      chunks += stageRepositoryTurns(objs, destinations, transcriptId, null, other);
+      chunks += stage(null, other);
     } else {
       advanceCursorToTranscriptTail(transcriptPath, other);
     }
@@ -1052,8 +1077,68 @@ function stageTranscriptDelta(transcriptPath, promptId, deviceId, repository) {
   return { chunks };
 }
 
+/**
+ * The part of the transcript staging reads: from the start of the earliest
+ * turn a cursor it resumes from sits in, so a turn that began before its
+ * cursor is still judged whole (turnDestinations). Those cursors are this
+ * repository's and every other repository's live one. Each must carry its
+ * turn's offset and be found past it; otherwise, or when a cursor cannot be
+ * read, the whole transcript is read, as for a rewritten one.
+ * @returns {{ objs: object[], offsets: number[] }}
+ */
+function readStagingWindow(transcriptPath, transcriptId, repository) {
+  const own = cursorPath(transcriptId, repository);
+  const resumed = [readBoundaryFile(own)];
+  for (const context of listRepositoryQueueContexts()) {
+    const file = path.join(context.cursors, `${transcriptId}.json`);
+    if (file === own) continue;
+    const other = readBoundaryFile(file);
+    if (other && !other.value?.discarded) resumed.push(other);
+  }
+  const placed = resumed.every((cursor) =>
+    typeof cursor?.value?.lastUuid === "string" && cursor.value.lastUuid &&
+    Number.isSafeInteger(cursor.value.turnOffset) && cursor.value.turnOffset >= 0);
+  if (placed) {
+    const start = Math.min(...resumed.map((cursor) => cursor.value.turnOffset));
+    const window = readTranscriptFrom(transcriptPath, start);
+    const found = window && resumed.every(({ value }) => {
+      const index = window.objs.findLastIndex((record) => record?.uuid === value.lastUuid);
+      return index !== -1 && window.offsets[index] >= value.turnOffset;
+    });
+    if (found) return window;
+  }
+  return readTranscriptFrom(transcriptPath, 0);
+}
+
+// The transcript from byte `start` on, parsed with offsets; null when `start`
+// is past its end or not at the start of a line. Throws when it cannot be read.
+function readTranscriptFrom(transcriptPath, start) {
+  const fd = fs.openSync(transcriptPath, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (start > size) return null;
+    if (start > 0) {
+      const before = Buffer.alloc(1);
+      fs.readSync(fd, before, 0, 1, start - 1);
+      if (before[0] !== 0x0a) return null;
+    }
+    const bytes = Buffer.alloc(size - start);
+    let length = 0;
+    while (length < bytes.length) {
+      const n = fs.readSync(fd, bytes, length, bytes.length - length, start + length);
+      if (n === 0) break;
+      length += n;
+    }
+    return parseJsonlAt(bytes.subarray(0, length), start);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 // Stage, for one repository, the turns after its cursor that belong to it.
-function stageRepositoryTurns(objs, destinations, transcriptId, promptId, repository) {
+// `turnOffsetOf(uuid)` is where the turn holding that record starts, kept on
+// the cursor so the next staging reads from there (readStagingWindow).
+function stageRepositoryTurns(objs, destinations, transcriptId, promptId, repository, turnOffsetOf) {
   const cursor = readCursor(transcriptId, repository);
   // A recorded hook with a prompt id gives the repository a cursor
   // (startTranscriptAtTurn), so without one nothing here was recorded for it.
@@ -1069,6 +1154,7 @@ function stageRepositoryTurns(objs, destinations, transcriptId, promptId, reposi
       writeCursor({
         transcriptId,
         lastUuid,
+        turnOffset: turnOffsetOf(lastUuid),
         seq: (cursor && cursor.seq) || 0,
         updatedAt: Date.now(),
         discarded: true,
@@ -1106,6 +1192,7 @@ function stageRepositoryTurns(objs, destinations, transcriptId, promptId, reposi
       transcriptId,
       wireId,
       lastUuid: plan.newCursor.lastUuid,
+      turnOffset: turnOffsetOf(plan.newCursor.lastUuid),
       seq: plan.newCursor.seq,
       baseline: plan.newCursor.baseline,
       updatedAt: Date.now(),
@@ -1265,27 +1352,22 @@ function advanceCursorToTranscriptTail(transcriptPath, repository, {
   const existing = readCursor(transcriptId, repository);
   if (onlyWhenMissing && existing) return false;
   const readAt = Date.now();
-  let raw;
-  try {
-    raw = fs.readFileSync(transcriptPath, "utf8");
-  } catch (err) {
-    return err.code === "ENOENT" ? false : null;
-  }
-  const { objs } = parseJsonl(raw);
-  const last = [...objs].reverse().find((record) =>
-    record && typeof record.uuid === "string" && record.uuid
-  );
-  if (!last) return false;
+  // Every hook of a period that is not recorded lands here, so only the end
+  // of the transcript is read: its cost must not grow with the session.
+  const tail = readTranscriptTail(transcriptPath);
+  if (tail === null) return null;
+  if (!tail.uuid) return false;
   // Hooks that run at once read the transcript at different lengths. A cursor
   // written since this read, past everything it saw, is not moved back.
   const current = onlyWhenMissing ? null : readCursor(transcriptId, repository);
-  if (current?.lastUuid && (current.updatedAt || 0) >= readAt &&
-      !objs.some((record) => record?.uuid === current.lastUuid)) {
-    return true;
+  if (current?.lastUuid && (current.updatedAt || 0) >= readAt) {
+    const seen = transcriptHasRecord(transcriptPath, current.lastUuid, tail.size);
+    if (seen === null) return null;
+    if (!seen) return true;
   }
   const written = writeCursor({
     transcriptId,
-    lastUuid: last.uuid,
+    lastUuid: tail.uuid,
     seq: existing?.seq || 0,
     updatedAt: Date.now(),
     discarded: !onlyWhenMissing,
@@ -1346,6 +1428,7 @@ function startTranscriptAtTurn(input, repository) {
 const UNLICENSED_MARK_DIR = path.join(LOG_DIR, "unlicensed-transcripts");
 // Every hook writes the mark while signed out, so only the end is read.
 const TAIL_BLOCK_BYTES = 64 * 1024;
+const SCAN_BLOCK_BYTES = 1024 * 1024;
 
 function unlicensedMarkPath(transcriptId) {
   return path.join(UNLICENSED_MARK_DIR, `${transcriptId}.json`);
@@ -1387,6 +1470,50 @@ function readTranscriptTail(transcriptPath, blockBytes = TAIL_BLOCK_BYTES) {
     return { uuid: "", size };
   } catch (err) {
     return err.code === "ENOENT" ? { uuid: "", size: 0 } : null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+// Whether a record with this uuid is in the first `size` bytes of the
+// transcript, read forward a block at a time; only lines that mention the
+// uuid are parsed. null when the transcript cannot be read.
+function transcriptHasRecord(transcriptPath, uuid, size, blockBytes = SCAN_BLOCK_BYTES) {
+  const needle = Buffer.from(uuid);
+  const isRecord = (line) => {
+    if (line.indexOf(needle) === -1) return false;
+    try {
+      return JSON.parse(line.toString("utf8"))?.uuid === uuid;
+    } catch {
+      return false;
+    }
+  };
+  let fd;
+  try {
+    fd = fs.openSync(transcriptPath, "r");
+    const block = Buffer.alloc(Math.max(1, Math.min(blockBytes, size)));
+    // A line longer than a block is kept in pieces and joined once, when it ends.
+    let pieces = [];
+    let position = 0;
+    while (position < size) {
+      const read = fs.readSync(fd, block, 0, Math.min(block.length, size - position), position);
+      if (read === 0) break;
+      position += read;
+      let start = 0;
+      let lineEnd;
+      while ((lineEnd = block.indexOf(0x0a, start)) !== -1 && lineEnd < read) {
+        pieces.push(block.subarray(start, lineEnd));
+        if (isRecord(pieces.length === 1 ? pieces[0] : Buffer.concat(pieces))) return true;
+        pieces = [];
+        start = lineEnd + 1;
+      }
+      if (start < read) pieces.push(Buffer.from(block.subarray(start, read)));
+    }
+    return isRecord(Buffer.concat(pieces));
+  } catch {
+    return null;
   } finally {
     if (fd !== undefined) {
       try { fs.closeSync(fd); } catch {}
@@ -1985,12 +2112,15 @@ module.exports = {
   markUnlicensedTranscript,
   recordPendingBoundary,
   transcriptTailUuid,
+  transcriptHasRecord,
+  readStagingWindow,
   listDeltaChunks,
   buildChunkHeaders,
   sealFinalSessionArtifacts,
   initializeTranscriptCursor,
   discardSkippedSessionArtifacts,
   clearDrainOnceLock,
+  takeDrainRequest,
   spawnDetachedDrain,
   drainFailedLogs,
   drainDeltaChunks,

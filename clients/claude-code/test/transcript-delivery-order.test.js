@@ -163,6 +163,39 @@ test("a chunk offline far longer than the retry budget is never set aside", asyn
   assert.equal(metaOf(body).uploadDeferrals, MAX_UPLOAD_ATTEMPTS + 2);
 });
 
+// A Stop that finds a drain running does not start another. The running drain
+// may have listed the queues before that Stop staged its turn, so the Stop
+// asks it for another pass instead of leaving the turn for the next one.
+test("a drain requested while another runs becomes one more pass of the running drain", () => {
+  const lock = path.join(LOG_DIR, ".drain-once.lock");
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.writeFileSync(lock, "running\n");
+  try {
+    assert.equal(transfer.spawnDetachedDrain(), false, "no second drain");
+    assert.equal(transfer.takeDrainRequest(), true, "the running drain is asked for another pass");
+    assert.equal(transfer.takeDrainRequest(), false, "once");
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+});
+
+test("drain_once runs the requested extra pass and leaves no request or lock behind", () => {
+  const { spawnSync } = require("child_process");
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.writeFileSync(path.join(LOG_DIR, ".drain-once.lock.again"), "");
+  const body = seal("again.jsonl", 1);
+  stubFetch([]);
+  const result = spawnSync(process.execPath, [path.join(__dirname, "../skillmeter/scripts/drain_once.js")], {
+    env: { ...process.env, SKILLMETER_BACKEND_URL: "http://127.0.0.1:9/collector" },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(path.join(LOG_DIR, ".drain-once.lock.again")), false);
+  assert.equal(fs.existsSync(path.join(LOG_DIR, ".drain-once.lock")), false);
+  assert.match(result.stderr, /Draining 1 transcript chunk/);
+  assert.equal(fs.existsSync(body), true, "the unreachable collector leaves the chunk queued");
+});
+
 test("every chunk of a generation carries its baseline", async () => {
   seal("gen.jsonl", 5, { reset: true, resetBaselineSeq: 5 });
   seal("gen.jsonl", 6, { resetBaselineSeq: 5 });

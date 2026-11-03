@@ -116,6 +116,18 @@ test("a turn that visits a repository the license does not cover is not sent", a
   assert.deepEqual(c.transcript(), ["after-u", "after-a"]);
 });
 
+// The next Stop reads from where that turn started, not from its cursor, so
+// the record written late is still judged with the rest of its turn.
+test("a late record of a turn that is not sent stays unsent", async (t) => {
+  const { c, s } = await start(t, { policy: BOTH });
+  await s.turn("mixed", { during: async () => { s.cd("foreign"); await s.tool("peek", { hook: false }); s.cd("repo"); } });
+  s.late("tail");
+  await s.turn("after");
+  await s.drained(() => c.transcript().includes("after-a"));
+  assert.deepEqual(c.transcript(), ["after-u", "after-a"]);
+  assert.ok(s.cursor(REPO_KEY).turnOffset > 0, "staging read from the cursor's turn");
+});
+
 // Turned on while the session is elsewhere: nothing seen it collect since.
 test("another repository's Stop sends nothing for one last seen turned off", async (t) => {
   const { c, s } = await start(t, { policy: OTHER_ON_ONLY });
