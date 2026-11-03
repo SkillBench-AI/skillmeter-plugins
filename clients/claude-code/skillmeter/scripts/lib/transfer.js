@@ -1281,27 +1281,22 @@ function advanceCursorToTranscriptTail(transcriptPath, repository, {
   const existing = readCursor(transcriptId, repository);
   if (onlyWhenMissing && existing) return false;
   const readAt = Date.now();
-  let raw;
-  try {
-    raw = fs.readFileSync(transcriptPath, "utf8");
-  } catch (err) {
-    return err.code === "ENOENT" ? false : null;
-  }
-  const { objs } = parseJsonl(raw);
-  const last = [...objs].reverse().find((record) =>
-    record && typeof record.uuid === "string" && record.uuid
-  );
-  if (!last) return false;
+  // Every hook of a period that is not recorded lands here, so only the end
+  // of the transcript is read: its cost must not grow with the session.
+  const tail = readTranscriptTail(transcriptPath);
+  if (tail === null) return null;
+  if (!tail.uuid) return false;
   // Hooks that run at once read the transcript at different lengths. A cursor
   // written since this read, past everything it saw, is not moved back.
   const current = onlyWhenMissing ? null : readCursor(transcriptId, repository);
-  if (current?.lastUuid && (current.updatedAt || 0) >= readAt &&
-      !objs.some((record) => record?.uuid === current.lastUuid)) {
-    return true;
+  if (current?.lastUuid && (current.updatedAt || 0) >= readAt) {
+    const seen = transcriptHasRecord(transcriptPath, current.lastUuid, tail.size);
+    if (seen === null) return null;
+    if (!seen) return true;
   }
   const written = writeCursor({
     transcriptId,
-    lastUuid: last.uuid,
+    lastUuid: tail.uuid,
     seq: existing?.seq || 0,
     updatedAt: Date.now(),
     discarded: !onlyWhenMissing,
@@ -1362,6 +1357,7 @@ function startTranscriptAtTurn(input, repository) {
 const UNLICENSED_MARK_DIR = path.join(LOG_DIR, "unlicensed-transcripts");
 // Every hook writes the mark while signed out, so only the end is read.
 const TAIL_BLOCK_BYTES = 64 * 1024;
+const SCAN_BLOCK_BYTES = 1024 * 1024;
 
 function unlicensedMarkPath(transcriptId) {
   return path.join(UNLICENSED_MARK_DIR, `${transcriptId}.json`);
@@ -1403,6 +1399,50 @@ function readTranscriptTail(transcriptPath, blockBytes = TAIL_BLOCK_BYTES) {
     return { uuid: "", size };
   } catch (err) {
     return err.code === "ENOENT" ? { uuid: "", size: 0 } : null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+// Whether a record with this uuid is in the first `size` bytes of the
+// transcript, read forward a block at a time; only lines that mention the
+// uuid are parsed. null when the transcript cannot be read.
+function transcriptHasRecord(transcriptPath, uuid, size, blockBytes = SCAN_BLOCK_BYTES) {
+  const needle = Buffer.from(uuid);
+  const isRecord = (line) => {
+    if (line.indexOf(needle) === -1) return false;
+    try {
+      return JSON.parse(line.toString("utf8"))?.uuid === uuid;
+    } catch {
+      return false;
+    }
+  };
+  let fd;
+  try {
+    fd = fs.openSync(transcriptPath, "r");
+    const block = Buffer.alloc(Math.max(1, Math.min(blockBytes, size)));
+    // A line longer than a block is kept in pieces and joined once, when it ends.
+    let pieces = [];
+    let position = 0;
+    while (position < size) {
+      const read = fs.readSync(fd, block, 0, Math.min(block.length, size - position), position);
+      if (read === 0) break;
+      position += read;
+      let start = 0;
+      let lineEnd;
+      while ((lineEnd = block.indexOf(0x0a, start)) !== -1 && lineEnd < read) {
+        pieces.push(block.subarray(start, lineEnd));
+        if (isRecord(pieces.length === 1 ? pieces[0] : Buffer.concat(pieces))) return true;
+        pieces = [];
+        start = lineEnd + 1;
+      }
+      if (start < read) pieces.push(Buffer.from(block.subarray(start, read)));
+    }
+    return isRecord(Buffer.concat(pieces));
+  } catch {
+    return null;
   } finally {
     if (fd !== undefined) {
       try { fs.closeSync(fd); } catch {}
@@ -2001,6 +2041,7 @@ module.exports = {
   markUnlicensedTranscript,
   recordPendingBoundary,
   transcriptTailUuid,
+  transcriptHasRecord,
   listDeltaChunks,
   buildChunkHeaders,
   sealFinalSessionArtifacts,

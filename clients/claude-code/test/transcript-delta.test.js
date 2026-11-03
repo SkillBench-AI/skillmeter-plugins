@@ -412,6 +412,47 @@ test("a discarded cursor is not moved back by a hook that read the transcript ea
   assert.equal(transfer.readCursor("race-cursor.jsonl", repository).lastUuid, "b", "written before this read");
 });
 
+test("transcriptHasRecord: a record's own uuid, within the bytes given", () => {
+  const file = path.join(DATA_DIR, "has-record.jsonl");
+  const lines = [
+    content("first", null, "été ".repeat(40)),
+    meta(),
+    content("second", "first"),
+  ];
+  writeFile(file, toJsonl(lines) + '{"uuid":"unfinished"');
+  const size = fs.statSync(file).size;
+  const firstTwo = Buffer.byteLength(toJsonl(lines.slice(0, 2)));
+  for (const blockBytes of [5, 100, 1024 * 1024]) {
+    const has = (uuid, upTo = size) => transfer.transcriptHasRecord(file, uuid, upTo, blockBytes);
+    assert.equal(has("first"), true, `blocks of ${blockBytes}`);
+    assert.equal(has("second"), true);
+    assert.equal(has("second", firstTwo), false, "past the bytes given");
+    assert.equal(has("unfinished"), false, "a partial line is no record");
+    assert.equal(has("ghost"), false);
+  }
+  // Named only as another record's parent.
+  writeFile(file, toJsonl([content("child", "parent")]));
+  assert.equal(transfer.transcriptHasRecord(file, "parent", fs.statSync(file).size), false);
+  assert.equal(transfer.transcriptHasRecord(path.join(DATA_DIR, "absent.jsonl"), "first", 10), null);
+});
+
+test("a discarded cursor written during the read is placed against lines past the tail block", () => {
+  const repository = { repoKey: "github.com/skillbench-ai/race-long", org: "skillbench-ai" };
+  const file = path.join(DATA_DIR, "race-long.jsonl");
+  const filler = Array.from({ length: 40 }, (_, i) => content(`f${i}`, null, "x".repeat(4096)));
+  writeFile(file, toJsonl([content("early"), ...filler, content("newest")]));
+  const cursor = (lastUuid) =>
+    transfer.writeCursor({ transcriptId: "race-long.jsonl", lastUuid, seq: 1, updatedAt: Date.now() + 60_000, discarded: true }, repository);
+
+  cursor("early");
+  assert.equal(transfer.advanceCursorToTranscriptTail(file, repository), true);
+  assert.equal(transfer.readCursor("race-long.jsonl", repository).lastUuid, "newest", "behind what this read saw");
+
+  cursor("later");
+  assert.equal(transfer.advanceCursorToTranscriptTail(file, repository), true);
+  assert.equal(transfer.readCursor("race-long.jsonl", repository).lastUuid, "later", "past what this read saw");
+});
+
 test("a signed-out mark ages out unless a cursor for its transcript remains", () => {
   const marks = path.join(DATA_DIR, "logs", "unlicensed-transcripts");
   for (const name of ["old.jsonl", "recent.jsonl", "old-cursored.jsonl", "old-cursored-elsewhere.jsonl"]) {
