@@ -35,8 +35,10 @@ const {
 } = require("./chunk-retry");
 const {
   parseJsonl,
+  parseJsonlAt,
   lastContentUuid,
   turnNumbers,
+  turnStartIndex,
   turnDestinations,
   buildChunkPlan,
 } = require("./transcript-delta");
@@ -1037,18 +1039,25 @@ function stageTranscriptDelta(transcriptPath, promptId, deviceId, repository) {
     return { chunks: 0, deferred: true };
   }
 
-  let raw;
+  let read;
   try {
-    raw = fs.readFileSync(transcriptPath, "utf8");
+    read = readStagingWindow(transcriptPath, transcriptId, repository);
   } catch (err) {
     console.error(`[skillmeter] Transcript delta read failed: ${err.message}`);
     return { chunks: 0 };
   }
 
-  const { objs } = parseJsonl(raw);
+  const { objs, offsets } = read;
+  const turns = turnNumbers(objs);
+  const turnOffsetOf = (uuid) => {
+    const index = uuid ? objs.findLastIndex((record) => record?.uuid === uuid) : -1;
+    return index === -1 ? undefined : offsets[turnStartIndex(turns, index)];
+  };
   const places = transcriptPlaces();
   const destinations = turnDestinations(objs, places.of, unrecordedTurns(transcriptId));
-  let chunks = stageRepositoryTurns(objs, destinations, transcriptId, promptId, repository);
+  const stage = (pid, target) =>
+    stageRepositoryTurns(objs, destinations, transcriptId, pid, target, turnOffsetOf);
+  let chunks = stage(promptId, repository);
   // A turn's own Stop may not stage it: the turn ended outside any repository,
   // or its last lines were written after that Stop read the transcript. Every
   // other repository already recording this transcript takes its turns here.
@@ -1060,7 +1069,7 @@ function stageTranscriptDelta(transcriptPath, promptId, deviceId, repository) {
     if (!cursor || cursor.discarded) continue;
     if (place.recording) {
       // The triggering turn is not this repository's, so no prompt id.
-      chunks += stageRepositoryTurns(objs, destinations, transcriptId, null, other);
+      chunks += stage(null, other);
     } else {
       advanceCursorToTranscriptTail(transcriptPath, other);
     }
@@ -1068,8 +1077,68 @@ function stageTranscriptDelta(transcriptPath, promptId, deviceId, repository) {
   return { chunks };
 }
 
+/**
+ * The part of the transcript staging reads: from the start of the earliest
+ * turn a cursor it resumes from sits in, so a turn that began before its
+ * cursor is still judged whole (turnDestinations). Those cursors are this
+ * repository's and every other repository's live one. Each must carry its
+ * turn's offset and be found past it; otherwise, or when a cursor cannot be
+ * read, the whole transcript is read, as for a rewritten one.
+ * @returns {{ objs: object[], offsets: number[] }}
+ */
+function readStagingWindow(transcriptPath, transcriptId, repository) {
+  const own = cursorPath(transcriptId, repository);
+  const resumed = [readBoundaryFile(own)];
+  for (const context of listRepositoryQueueContexts()) {
+    const file = path.join(context.cursors, `${transcriptId}.json`);
+    if (file === own) continue;
+    const other = readBoundaryFile(file);
+    if (other && !other.value?.discarded) resumed.push(other);
+  }
+  const placed = resumed.every((cursor) =>
+    typeof cursor?.value?.lastUuid === "string" && cursor.value.lastUuid &&
+    Number.isSafeInteger(cursor.value.turnOffset) && cursor.value.turnOffset >= 0);
+  if (placed) {
+    const start = Math.min(...resumed.map((cursor) => cursor.value.turnOffset));
+    const window = readTranscriptFrom(transcriptPath, start);
+    const found = window && resumed.every(({ value }) => {
+      const index = window.objs.findLastIndex((record) => record?.uuid === value.lastUuid);
+      return index !== -1 && window.offsets[index] >= value.turnOffset;
+    });
+    if (found) return window;
+  }
+  return readTranscriptFrom(transcriptPath, 0);
+}
+
+// The transcript from byte `start` on, parsed with offsets; null when `start`
+// is past its end or not at the start of a line. Throws when it cannot be read.
+function readTranscriptFrom(transcriptPath, start) {
+  const fd = fs.openSync(transcriptPath, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (start > size) return null;
+    if (start > 0) {
+      const before = Buffer.alloc(1);
+      fs.readSync(fd, before, 0, 1, start - 1);
+      if (before[0] !== 0x0a) return null;
+    }
+    const bytes = Buffer.alloc(size - start);
+    let length = 0;
+    while (length < bytes.length) {
+      const n = fs.readSync(fd, bytes, length, bytes.length - length, start + length);
+      if (n === 0) break;
+      length += n;
+    }
+    return parseJsonlAt(bytes.subarray(0, length), start);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 // Stage, for one repository, the turns after its cursor that belong to it.
-function stageRepositoryTurns(objs, destinations, transcriptId, promptId, repository) {
+// `turnOffsetOf(uuid)` is where the turn holding that record starts, kept on
+// the cursor so the next staging reads from there (readStagingWindow).
+function stageRepositoryTurns(objs, destinations, transcriptId, promptId, repository, turnOffsetOf) {
   const cursor = readCursor(transcriptId, repository);
   // A recorded hook with a prompt id gives the repository a cursor
   // (startTranscriptAtTurn), so without one nothing here was recorded for it.
@@ -1085,6 +1154,7 @@ function stageRepositoryTurns(objs, destinations, transcriptId, promptId, reposi
       writeCursor({
         transcriptId,
         lastUuid,
+        turnOffset: turnOffsetOf(lastUuid),
         seq: (cursor && cursor.seq) || 0,
         updatedAt: Date.now(),
         discarded: true,
@@ -1122,6 +1192,7 @@ function stageRepositoryTurns(objs, destinations, transcriptId, promptId, reposi
       transcriptId,
       wireId,
       lastUuid: plan.newCursor.lastUuid,
+      turnOffset: turnOffsetOf(plan.newCursor.lastUuid),
       seq: plan.newCursor.seq,
       baseline: plan.newCursor.baseline,
       updatedAt: Date.now(),
@@ -2042,6 +2113,7 @@ module.exports = {
   recordPendingBoundary,
   transcriptTailUuid,
   transcriptHasRecord,
+  readStagingWindow,
   listDeltaChunks,
   buildChunkHeaders,
   sealFinalSessionArtifacts,

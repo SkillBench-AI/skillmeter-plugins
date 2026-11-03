@@ -67,6 +67,17 @@ test("parseJsonl: mid-file malformed line is skipped, not fatal", () => {
   assert.equal(malformed, 1);
 });
 
+test("parseJsonlAt: each record with its byte offset in the transcript, lines skipped as parseJsonl does", () => {
+  const lines = [JSON.stringify(content("a", null, "été")), "", "{bad json}", JSON.stringify(content("b")), '{"uuid":"partial"'];
+  const bytes = Buffer.from(lines.join("\n"));
+  const { objs, offsets } = d.parseJsonlAt(bytes, 100);
+  assert.deepEqual(objs.map((o) => o.uuid), ["a", "b"]);
+  assert.deepEqual(objs, d.parseJsonl(bytes.toString("utf8")).objs);
+  const b = Buffer.byteLength(lines.slice(0, 3).join("\n") + "\n");
+  assert.deepEqual(offsets, [100, 100 + b]);
+  assert.deepEqual(d.parseJsonlAt(Buffer.alloc(0)), { objs: [], offsets: [] });
+});
+
 // ---- lastContentUuid -------------------------------------------------------
 test("lastContentUuid: returns newest uuid", () => {
   assert.equal(d.lastContentUuid([content("a"), content("b"), content("c")]), "c");
@@ -108,6 +119,11 @@ test("turnNumbers: a new promptId starts a turn; its tool results and replies st
     meta(),
   ];
   assert.deepEqual(d.turnNumbers(objs), [0, 1, 1, 1, 1, 2, 2]);
+});
+
+test("turnStartIndex: the first record numbered as the given one", () => {
+  const turns = [0, 1, 1, 1, 2, 2];
+  assert.deepEqual([0, 1, 2, 3, 4, 5].map((i) => d.turnStartIndex(turns, i)), [0, 1, 1, 1, 4, 4]);
 });
 
 test("turnNumbers: without promptIds, a user record that is not a tool result starts a turn", () => {
@@ -869,4 +885,62 @@ test("a chunk still inside its backoff window is not eligible, but is still queu
     transfer.listDeltaChunks().includes(body),
     "still counted as queued work while it waits"
   );
+});
+
+// ---- staging reads from the turn its cursor is in ---------------------------
+const WINDOW_REPOSITORY = { repoKey: "github.com/skillbench-ai/window", org: "skillbench-ai" };
+const ask = (uuid, promptId) => ({ type: "user", uuid, promptId, message: { content: "ask" } });
+const reply = (uuid, promptId) => ({ ...content(uuid), promptId });
+
+test("staging keeps where its cursor's turn starts and reads the next delta from there", () => {
+  const file = path.join(DATA_DIR, "window.jsonl");
+  const turn1 = toJsonl([ask("q1", "p1"), reply("a1", "p1")]);
+  const turn2 = toJsonl([ask("q2", "p2"), reply("a2", "p2")]);
+  writeFile(file, turn1 + turn2);
+  assert.deepEqual(stagedUuids(file, WINDOW_REPOSITORY), ["q1", "a1", "q2", "a2"]);
+  assert.equal(transfer.readCursor("window.jsonl", WINDOW_REPOSITORY).turnOffset, Buffer.byteLength(turn1));
+
+  // A late record of turn 2, then turn 3.
+  const late = toJsonl([reply("a2-late", "p2")]);
+  fs.appendFileSync(file, late + toJsonl([ask("q3", "p3"), reply("a3", "p3")]));
+  const window = transfer.readStagingWindow(file, "window.jsonl", WINDOW_REPOSITORY);
+  assert.deepEqual(window.objs.map((o) => o.uuid), ["q2", "a2", "a2-late", "q3", "a3"]);
+  assert.deepEqual(stagedUuids(file, WINDOW_REPOSITORY), ["a2-late", "q3", "a3"]);
+  assert.equal(transfer.readCursor("window.jsonl", WINDOW_REPOSITORY).turnOffset,
+    Buffer.byteLength(turn1 + turn2 + late));
+});
+
+test("staging reads the whole transcript when a cursor it resumes from cannot be placed", () => {
+  const id = "window-fallback.jsonl";
+  const file = path.join(DATA_DIR, id);
+  const turn1 = toJsonl([ask("q1", "p1"), reply("a1", "p1")]);
+  writeFile(file, turn1 + toJsonl([ask("q2", "p2"), reply("a2", "p2")]));
+  const q2 = Buffer.byteLength(turn1);
+  const other = { repoKey: "github.com/skillbench-ai/window-other", org: "skillbench-ai" };
+  const write = (repository, cursor) =>
+    transfer.writeCursor({ transcriptId: id, seq: 1, updatedAt: 0, ...cursor }, repository);
+  const firstRead = () => transfer.readStagingWindow(file, id, WINDOW_REPOSITORY).objs[0].uuid;
+
+  write(WINDOW_REPOSITORY, { lastUuid: "a2", turnOffset: q2 });
+  assert.equal(firstRead(), "q2", "placed");
+  for (const [cursor, why] of [
+    [{ lastUuid: "a2" }, "no offset, as a cursor written before it was kept"],
+    [{ lastUuid: "a2", turnOffset: q2 + 1 }, "not at the start of a line"],
+    [{ lastUuid: "a1", turnOffset: q2 }, "its record lies before the offset"],
+    [{ lastUuid: "gone", turnOffset: q2 }, "the transcript was rewritten"],
+    [{ lastUuid: "a2", turnOffset: 1e9 }, "past the end"],
+    [{ lastUuid: null, turnOffset: 0 }, "no record yet"],
+  ]) {
+    write(WINDOW_REPOSITORY, cursor);
+    assert.equal(firstRead(), "q1", why);
+  }
+
+  // Another repository's live cursor counts too; a discarded one does not.
+  write(WINDOW_REPOSITORY, { lastUuid: "a2", turnOffset: q2 });
+  write(other, { lastUuid: "a1", turnOffset: 0 });
+  assert.equal(firstRead(), "q1", "from the other cursor's earlier turn");
+  write(other, { lastUuid: "a1" });
+  assert.equal(firstRead(), "q1", "the other cursor cannot be placed");
+  write(other, { lastUuid: "a1", discarded: true });
+  assert.equal(firstRead(), "q2", "a discarded cursor is not resumed from");
 });

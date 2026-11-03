@@ -36,6 +36,30 @@ function parseJsonl(raw) {
 }
 
 /**
+ * parseJsonl over bytes read from byte `base` of a transcript, with each
+ * object's offset in the transcript beside it. Lines are skipped as parseJsonl
+ * skips them.
+ * @returns {{ objs: object[], offsets: number[] }}
+ */
+function parseJsonlAt(bytes, base = 0) {
+  const objs = [];
+  const offsets = [];
+  let start = 0;
+  while (start < bytes.length) {
+    let end = bytes.indexOf(0x0a, start);
+    if (end === -1) end = bytes.length;
+    if (end > start) {
+      try {
+        objs.push(JSON.parse(bytes.toString("utf8", start, end)));
+        offsets.push(base + start);
+      } catch {}
+    }
+    start = end + 1;
+  }
+  return { objs, offsets };
+}
+
+/**
  * Newest content uuid in order: scan from the end for the first object with a
  * non-empty string `uuid`. Metadata lines (mode, permission-mode, …) have no
  * uuid and are skipped. Returns null when there is no content line.
@@ -80,6 +104,14 @@ function turnNumbers(objs) {
     turns[i] = turn;
   }
   return turns;
+}
+
+// The index of the first record of the turn holding record `index`, given
+// turnNumbers' result.
+function turnStartIndex(turns, index) {
+  let first = index;
+  while (first > 0 && turns[first - 1] === turns[index]) first--;
+  return first;
 }
 
 function startsTurn(record, promptId) {
@@ -256,9 +288,11 @@ function buildChunkPlan(objs, cursor, salt, opts = {}) {
 
 module.exports = {
   parseJsonl,
+  parseJsonlAt,
   lastContentUuid,
   computeDelta,
   turnNumbers,
+  turnStartIndex,
   turnDestinations,
   splitLinesByBudget,
   splitByEnvelope,
