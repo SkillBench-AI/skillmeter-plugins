@@ -69,6 +69,28 @@ function completeEventCutover(purge, queueEmpty = () => false) {
   }) === true || isEventCutoverComplete();
 }
 
+// Explicit maintainer recovery for a markerless broker session. The callback
+// must preserve pending events outside the upload queue and return only after
+// its archive is durable. Unlike the first-run path, this never purges events.
+// Both the queue move and marker commit run under the session lock, so current
+// hooks cannot interleave capture with the recovery operation.
+function completeQuarantinedEventCutover(quarantine, queueEmpty) {
+  return mutateSession(session => {
+    if (Object.hasOwn(session, "event_cutover")) return false;
+    let raw;
+    try { raw = fs.readFileSync(config.sessionFile(), "utf8"); }
+    catch { return false; }
+    try {
+      const value = JSON.parse(raw);
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    } catch { return false; }
+    if (session.signed_out === true || (!session.license_jwt && !session.refresh_token)) return false;
+    if (quarantine() !== true || queueEmpty() !== true) return false;
+    session.event_cutover = 1;
+    session.created_at ||= new Date().toISOString();
+  }) === true;
+}
+
 const isEventCutoverComplete = () => readSession().event_cutover === 1;
 
 // Signed in: a license is held and the user has not signed out. Freshness is
@@ -193,6 +215,7 @@ module.exports = {
   getLicenseTokenUncached: getLicenseToken,
   ensureSessionFile,
   completeEventCutover,
+  completeQuarantinedEventCutover,
   isEventCutoverComplete,
   isSignedIn,
   getSignedOut,

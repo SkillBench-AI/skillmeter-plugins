@@ -106,9 +106,27 @@ sessions and retry. An existing broker session without a completion record is
 ambiguous when event batches remain: the plugin holds those batches rather than
 deleting potentially new events. An empty event queue can complete cutover
 without discarding data. Preserve a verified backup and resolve its disposition with support
-before resetting state or signing out. This hold is not a recovery workflow and
+before resetting state or signing out. The automatic hold is not a recovery workflow and
 does not disable the existing age-based cleanup. Do not run old plugin workers
 alongside the upgrade: they do not honor the new completion gate.
+
+For a reviewed markerless broker session with **exactly one active**
+`events.jsonl` file and no sealed pending batches, a maintainer can use
+`node "$PLUGIN_ROOT/bin/sk-recover-cutover" --expected-sha256 DIGEST`.
+First close older Codex sessions and stop old plugin workers. Preserve a
+separate verified backup, then calculate the SHA-256 of the active file in the
+installation's persistent `logs` directory. The command refuses a changed
+digest, extra pending batch, busy file, malformed session, or completed cutover.
+It takes the session and event-file locks, makes a private verified copy, and
+moves the original into `logs/cutover-review/` before recording completion.
+This directory is outside the upload queue and is not subject to automatic
+event cleanup. The command makes no network request. Keep its files private and
+decide their retention or later disposition separately; a cutover marker does
+not establish that the quarantined events were delivered. The old broker
+license may be expired, so sign in again afterward and verify new capture.
+Source-checkout use requires `PLUGIN_DATA` set to the installed plugin's
+persistent data directory. This operation does not install or upgrade the
+running plugin.
 
 Upgrading from a version that used the machine-wide shared consent record
 starts with no Codex consent: record the organization and repository again.
