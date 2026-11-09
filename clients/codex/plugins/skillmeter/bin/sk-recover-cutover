@@ -1,0 +1,5 @@
+#!/usr/bin/env node
+const path = require("node:path");
+const root = process.env.PLUGIN_ROOT || path.resolve(__dirname, "..");
+process.env.PLUGIN_ROOT = root;
+process.exitCode = require(path.join(root, "scripts", "cutover-recovery.js")).main();
